@@ -110,7 +110,6 @@ ppl::common::RetCode moe_column_parallel_linear(
         }
     }
 
-
     if (gather_output && nccl_param->size > 1) {
         status = ppl::common::NcclAllGather<half>(
             (half*)gemm_output,
