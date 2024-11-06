@@ -32,7 +32,8 @@ struct moe_column_parallel_linear_config {
     int32_t gemm_groups;
     // int32_t nccl_size;
 
-    uint64_t buffer_size;
+    uint64_t device_buffer_size;
+    uint64_t host_buffer_size;
     uint64_t matrix_c_size;
     int32_t problem_sizes;
     int32_t ptr_x_size;
@@ -43,8 +44,7 @@ struct moe_column_parallel_linear_config {
     void* device_buffer;
     void* matrix_ds;
     void* gather_buffer;
-
-    std::vector<int8_t> host_buffer;
+    std::vector<uint8_t> host_buffer;
 
     size_t workspace_size;
     int32_t arguments_workspace_id;

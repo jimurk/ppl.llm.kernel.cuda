@@ -214,50 +214,52 @@ ppl::common::RetCode moe_column_parallel_linear_input_size(
     config.K = in_features;
     config.gemm_groups = config.num_experts;
 
-    uint64_t buffer_size = 0;
+    uint64_t device_buffer_size = 0;
+    uint64_t host_buffer_size = 0;
     uint64_t matrix_c_size = CEILING(config.M * config.N_d * sizeof(ElementC), 127, 7);
     if (bias != nullptr) {
-        buffer_size += matrix_c_size;  // matrix c
+        device_buffer_size += matrix_c_size;  // matrix c
     }
     config.matrix_c_size = matrix_c_size;
 
     if (gather_output && nccl_size > 1) {
-        buffer_size += matrix_c_size * nccl_size;  // gather_buffer, namely, matrix_ds
+        device_buffer_size += matrix_c_size * nccl_size;  // gather_buffer, namely, matrix_ds
     }
 
     int32_t problem_sizes = CEILING((sizeof(int32_t) * 3 * config.gemm_groups), 127, 7);
-    buffer_size += problem_sizes;
+    host_buffer_size    += problem_sizes;
     config.problem_sizes = problem_sizes;
 
     // ElementA*, ElementB*, ElementC* and ElementD* have the same size, 8 bytes.
     int32_t ptr_x_size = CEILING((sizeof(ElementA*) * config.gemm_groups), 127, 7);
     if (bias != nullptr) {
-        buffer_size += ptr_x_size * 4;
+        host_buffer_size += ptr_x_size * 4;
     }
     else {
-        buffer_size += ptr_x_size * 3;
+        host_buffer_size += ptr_x_size * 3;
     }
     config.ptr_x_size = ptr_x_size;
 
     int32_t stride_As_size = CEILING((sizeof(StrideA) * config.gemm_groups), 127, 7);
-    buffer_size += stride_As_size;
+    host_buffer_size     += stride_As_size;
     config.stride_As_size = stride_As_size;
 
     int32_t stride_Bs_size = CEILING((sizeof(StrideB) * config.gemm_groups), 127, 7);
-    buffer_size += stride_Bs_size;
+    host_buffer_size     += stride_Bs_size;
     config.stride_Bs_size = stride_Bs_size;
 
     int32_t stride_Cs_size = 0;
     if (bias != nullptr) {
         stride_Cs_size = CEILING((sizeof(StrideC) * config.gemm_groups), 127, 7);
     }
-    buffer_size += stride_Cs_size;
+    host_buffer_size     += stride_Cs_size;
     config.stride_Cs_size = stride_Cs_size;
 
     int32_t stride_Ds_size = CEILING((sizeof(StrideD) * config.gemm_groups), 127, 7);
-    buffer_size += stride_Ds_size;
+    host_buffer_size     += stride_Ds_size;
     config.stride_Ds_size = stride_Ds_size;
-    config.buffer_size = buffer_size;
+    config.device_buffer_size = device_buffer_size + host_buffer_size;
+    config.host_buffer_size   = host_buffer_size;
 
     std::cout << "config.num_experts: " << config.num_experts << std::endl;
     std::cout << "config.M: " << config.M << std::endl;
@@ -270,7 +272,8 @@ ppl::common::RetCode moe_column_parallel_linear_input_size(
     std::cout << "config.stride_Bs_size: " << config.stride_Bs_size << std::endl;
     std::cout << "config.stride_Cs_size: " << config.stride_Cs_size << std::endl;
     std::cout << "config.stride_Ds_size: " << config.stride_Ds_size << std::endl;
-    std::cout << "config.buffer_size: " << config.buffer_size << std::endl;
+    std::cout << "config.device_buffer_size: " << config.device_buffer_size << std::endl;
+    std::cout << "config.host_buffer_size: " << config.host_buffer_size << std::endl;
 
     return ppl::common::RC_SUCCESS;
 }
@@ -348,9 +351,6 @@ ppl::common::RetCode moe_column_parallel_grouped_gemm(
     }
     config.gather_buffer = gather_buffer;
     config.matrix_ds = (void*)matrix_ds;
-    // if (bias == nullptr) {
-        // cudaMemset((void *)matrix_cs, config.matrix_c_size, 0);
-    // }
     if (bias != nullptr) {
         set_matrix_c(stream, (ElementC*)bias, (const int64_t*)expert_offset_host,
                      (int32_t*)matrix_ds, config.num_experts, config.M,
@@ -358,73 +358,94 @@ ppl::common::RetCode moe_column_parallel_grouped_gemm(
     }
     const ElementA** ptr_As_device = (const ElementA**)((uint8_t*)problem_sizes_device + config.problem_sizes);
     const ElementB** ptr_Bs_device = (const ElementB**)((uint8_t*)ptr_As_device + config.ptr_x_size);
-    const ElementC** ptr_Cs_device = (const ElementC**)((uint8_t*)ptr_Bs_device + config.ptr_x_size);
-    ElementC** ptr_Ds_device = (ElementC**)((uint8_t*)ptr_Cs_device + config.ptr_x_size);
+    const ElementC** ptr_Cs_device = nullptr;
+    ElementC** ptr_Ds_device = nullptr;
+    if (bias != nullptr) {
+        ptr_Cs_device = (const ElementC**)((uint8_t*)ptr_Bs_device + config.ptr_x_size);
+        ptr_Ds_device = (ElementC**)((uint8_t*)ptr_Cs_device + config.ptr_x_size);
+    }
+    else {
+        ptr_Ds_device = (ElementC**)((uint8_t*)ptr_Bs_device + config.ptr_x_size);
+    }
     StrideA* stride_A_device = (StrideA*)((uint8_t*)ptr_Ds_device + config.ptr_x_size);
     StrideB* stride_B_device = (StrideB*)((uint8_t*)stride_A_device + config.stride_As_size);
-    StrideC* stride_C_device = (StrideC*)((uint8_t*)stride_B_device + config.stride_Bs_size);
-    StrideD* stride_D_device = (StrideD*)((uint8_t*)stride_C_device + config.stride_Cs_size);
+    StrideC* stride_C_device = nullptr;
+    StrideD* stride_D_device = nullptr;
+    if (bias != nullptr) {
+        stride_C_device = (StrideC*)((uint8_t*)stride_B_device + config.stride_Bs_size);
+        stride_D_device = (StrideD*)((uint8_t*)stride_C_device + config.stride_Cs_size);
+    }
+    else {
+        stride_D_device = (StrideD*)((uint8_t*)stride_B_device + config.stride_Bs_size);
+    }
 
-    std::vector<ElementA*> ptr_A_host(config.gemm_groups);
-    std::vector<ElementB*> ptr_B_host(config.gemm_groups);
-    std::vector<ElementC*> ptr_C_host(config.gemm_groups);
-    std::vector<ElementC*> ptr_D_host(config.gemm_groups);
+    config.host_buffer.reserve(config.host_buffer_size);
+    int32_t* problem_sizes_host = (int32_t*)config.host_buffer.data();
+    ElementA** ptr_As_host = (ElementA**)((uint8_t*)problem_sizes_host + config.problem_sizes);
+    ElementB** ptr_Bs_host = (ElementB**)((uint8_t*)ptr_As_host + config.ptr_x_size);
+    ElementC** ptr_Cs_host = nullptr;
+    ElementC** ptr_Ds_host = nullptr;
+    if (bias != nullptr) {
+        ptr_Cs_host = (ElementC**)((uint8_t*)ptr_Bs_host + config.ptr_x_size);
+        ptr_Ds_host = (ElementC**)((uint8_t*)ptr_Cs_host + config.ptr_x_size);
+    }
+    else {
+        ptr_Ds_host = (ElementC**)((uint8_t*)ptr_Bs_host + config.ptr_x_size);
+    }
+    StrideA* stride_A_host = (StrideA*)((uint8_t*)ptr_Ds_host + config.ptr_x_size);
+    StrideB* stride_B_host = (StrideB*)((uint8_t*)stride_A_host + config.stride_As_size);
+    StrideC* stride_C_host = nullptr;
+    StrideD* stride_D_host = nullptr;
+    if (bias != nullptr) {
+        stride_C_host = (StrideC*)((uint8_t*)stride_B_host + config.stride_Bs_size);
+        stride_D_host = (StrideD*)((uint8_t*)stride_C_host + config.stride_Cs_size);
+    }
+    else {
+        stride_D_host = (StrideD*)((uint8_t*)stride_B_host + config.stride_Bs_size);
+    }
 
-    std::vector<StrideA> stride_A_host;
-    std::vector<StrideB> stride_B_host;
-    std::vector<StrideC> stride_C_host;
-    std::vector<StrideD> stride_D_host;  // use stride_C_host?
-
+    int32_t N = config.N_d;
+    int32_t K = config.K;
+    int64_t elements_A, elements_B = K * N, elements_C;
+    const int64_t* expert_offset = (const int64_t*)expert_offset_host;
     int64_t total_elements_A = 0;
     int64_t total_elements_B = 0;
     int64_t total_elements_C = 0;
     // int64_t total_elements_D = 0;
-
-    config.host_buffer.reserve(config.problem_sizes);
-    int32_t* problem_sizes_host = (int32_t*)config.host_buffer.data();
     int32_t index = 0;
-    int32_t N = config.N_d;
-    int32_t K = config.K;
-    int64_t elements_B = K * N;
-    const int64_t* expert_offset = (const int64_t*)expert_offset_host;
     for (int32_t i = 0; i < config.gemm_groups; i++, index += 3) {
         int32_t M = expert_offset[i + 1] - expert_offset[i];
         problem_sizes_host[index] = M;
         problem_sizes_host[index + 1] = N;
         problem_sizes_host[index + 2] = K;
 
-        ptr_A_host.at(i) = (ElementA *)input + total_elements_A;
-        ptr_B_host.at(i) = (ElementB *)weight + total_elements_B;
-        ptr_C_host.at(i) = (ElementC *)matrix_cs + total_elements_C;
-        ptr_D_host.at(i) = (ElementC *)matrix_ds + total_elements_C;
+        ptr_As_host[i] = (ElementA*)input + total_elements_A;
+        ptr_Bs_host[i] = (ElementB*)weight + total_elements_B;
+        if (bias != nullptr) {
+            ptr_Cs_host[i] = (ElementC*)matrix_cs + total_elements_C;
+        }
+        ptr_Ds_host[i] = (ElementC*)matrix_ds + total_elements_C;
 
-        int64_t elements_A = M * K;
-        int64_t elements_C = M * N;
-
+        elements_A = M * K;
+        elements_C = M * N;
         total_elements_A += elements_A;
         total_elements_B += elements_B;
         total_elements_C += elements_C;
-        // total_elements_D += elements_C;
 
-        stride_A_host.push_back(cutlass::make_cute_packed_stride(StrideA{}, {M, K, 1}));
-        stride_B_host.push_back(cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1}));
-        stride_C_host.push_back(cutlass::make_cute_packed_stride(StrideC{}, {M, N, 1})); // stride<N, 1, 0>
-        stride_D_host.push_back(cutlass::make_cute_packed_stride(StrideD{}, {M, N, 1}));
+        *stride_A_host++ = cutlass::make_cute_packed_stride(StrideA{}, {M, K, 1});
+        *stride_B_host++ = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
+        if (bias != nullptr) {
+            *stride_C_host++ = cutlass::make_cute_packed_stride(StrideC{}, {M, N, 1}); // stride<N, 1, 0>
+        }
+        *stride_D_host++ = cutlass::make_cute_packed_stride(StrideD{}, {M, N, 1});
     }
     int32_t index_p = 0;  //debug
     for (int32_t i = 0; i < config.gemm_groups; i++) {
         std::cout << i << ", problem size: " << problem_sizes_host[index_p] << ", " << problem_sizes_host[index_p+1] << ", " << problem_sizes_host[index_p+2] << std::endl;
         index_p += 3;
     }
-    cudaMemcpy(problem_sizes_device, problem_sizes_host, config.problem_sizes, cudaMemcpyHostToDevice);
-    cudaMemcpy(ptr_As_device, ptr_A_host.data(), config.ptr_x_size, cudaMemcpyHostToDevice);
-    cudaMemcpy(ptr_Bs_device, ptr_B_host.data(), config.ptr_x_size, cudaMemcpyHostToDevice);
-    cudaMemcpy(ptr_Cs_device, ptr_C_host.data(), config.ptr_x_size, cudaMemcpyHostToDevice);
-    cudaMemcpy(ptr_Ds_device, ptr_D_host.data(), config.ptr_x_size, cudaMemcpyHostToDevice);
-    cudaMemcpy(stride_A_device, stride_A_host.data(), config.stride_As_size, cudaMemcpyHostToDevice);
-    cudaMemcpy(stride_B_device, stride_B_host.data(), config.stride_Bs_size, cudaMemcpyHostToDevice);
-    cudaMemcpy(stride_C_device, stride_C_host.data(), config.stride_Cs_size, cudaMemcpyHostToDevice);
-    cudaMemcpy(stride_D_device, stride_D_host.data(), config.stride_Ds_size, cudaMemcpyHostToDevice);
+    cudaMemcpy((void*)problem_sizes_device, (const void*)config.host_buffer.data(),
+               config.host_buffer_size, cudaMemcpyHostToDevice);
 
     cutlass::KernelHardwareInfo hw_info;
     // Change device_id to another value if you are running on a machine with multiple GPUs and wish
