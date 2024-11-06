@@ -35,7 +35,7 @@ struct moe_column_parallel_linear_config {
     uint64_t buffer_size;
     uint64_t matrix_c_size;
     int32_t problem_sizes;
-    int32_t ptr_x_size;  // should be differnent for a/b/c/c
+    int32_t ptr_x_size;
     int32_t stride_As_size;
     int32_t stride_Bs_size;
     int32_t stride_Cs_size;
@@ -55,6 +55,7 @@ ppl::common::RetCode moe_column_parallel_linear_input_size(
     const ppl::common::TensorShape* weight_shape,
     const int64_t in_features,
     const int64_t out_features,
+    const void* bias,
     const bool gather_output,
     const ppl::common::NcclParam* nccl_param,
     moe_column_parallel_linear_config& config);

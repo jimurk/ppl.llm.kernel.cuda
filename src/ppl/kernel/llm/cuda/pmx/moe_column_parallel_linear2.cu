@@ -186,6 +186,7 @@ ppl::common::RetCode moe_column_parallel_linear_input_size(
     const ppl::common::TensorShape* weight_shape,
     const int64_t in_features,
     const int64_t out_features,
+    const void* bias,
     const bool gather_output,
     const ppl::common::NcclParam* nccl_param,
     moe_column_parallel_linear_config& config)
@@ -213,10 +214,11 @@ ppl::common::RetCode moe_column_parallel_linear_input_size(
     config.K = in_features;
     config.gemm_groups = config.num_experts;
 
-    // if (bias == nullptr) matrix_c_size = 0;
     uint64_t buffer_size = 0;
     uint64_t matrix_c_size = CEILING(config.M * config.N_d * sizeof(ElementC), 127, 7);
-    buffer_size += matrix_c_size;  // matrix c
+    if (bias != nullptr) {
+        buffer_size += matrix_c_size;  // matrix c
+    }
     config.matrix_c_size = matrix_c_size;
 
     if (gather_output && nccl_size > 1) {
@@ -229,7 +231,12 @@ ppl::common::RetCode moe_column_parallel_linear_input_size(
 
     // ElementA*, ElementB*, ElementC* and ElementD* have the same size, 8 bytes.
     int32_t ptr_x_size = CEILING((sizeof(ElementA*) * config.gemm_groups), 127, 7);
-    buffer_size += ptr_x_size * 4;
+    if (bias != nullptr) {
+        buffer_size += ptr_x_size * 4;
+    }
+    else {
+        buffer_size += ptr_x_size * 3;
+    }
     config.ptr_x_size = ptr_x_size;
 
     int32_t stride_As_size = CEILING((sizeof(StrideA) * config.gemm_groups), 127, 7);
@@ -240,7 +247,10 @@ ppl::common::RetCode moe_column_parallel_linear_input_size(
     buffer_size += stride_Bs_size;
     config.stride_Bs_size = stride_Bs_size;
 
-    int32_t stride_Cs_size = CEILING((sizeof(StrideC) * config.gemm_groups), 127, 7);
+    int32_t stride_Cs_size = 0;
+    if (bias != nullptr) {
+        stride_Cs_size = CEILING((sizeof(StrideC) * config.gemm_groups), 127, 7);
+    }
     buffer_size += stride_Cs_size;
     config.stride_Cs_size = stride_Cs_size;
 
@@ -313,27 +323,38 @@ ppl::common::RetCode moe_column_parallel_grouped_gemm(
         return ppl::common::RC_UNSUPPORTED;
     }
 
-    ElementC* matrix_cs = (ElementC*)config.device_buffer;
+    ElementC* matrix_cs = nullptr;
+    if (bias != nullptr) {
+        matrix_cs = (ElementC*)config.device_buffer;
+    }
     void* gather_buffer = nullptr;
-    ElementC* matrix_ds;
-    int32_t* problem_sizes_device;
+    ElementC* matrix_ds = nullptr;
+    int32_t* problem_sizes_device = nullptr;
     if (gather_output && nccl_param->size > 1) {
-        gather_buffer = (ElementC*)((uint8_t*)config.device_buffer + config.matrix_c_size);
+        if (bias != nullptr) {
+            gather_buffer = (void*)((uint8_t*)config.device_buffer + config.matrix_c_size);
+        }
         matrix_ds = (ElementC*)((uint8_t*)gather_buffer + config.matrix_c_size * nccl_param->rank);
         problem_sizes_device = (int32_t*)((uint8_t*)gather_buffer + config.matrix_c_size * nccl_param->size);
     }
     else {
         matrix_ds = (ElementC*)output;
-        problem_sizes_device = (int32_t*)((uint8_t*)matrix_cs + config.matrix_c_size);
+        if (bias != nullptr) {
+            problem_sizes_device = (int32_t*)((uint8_t*)matrix_cs + config.matrix_c_size);
+        }
+        else {
+            problem_sizes_device = (int32_t*)config.device_buffer;
+        }
     }
     config.gather_buffer = gather_buffer;
     config.matrix_ds = (void*)matrix_ds;
-    if (bias == nullptr) {
-        cudaMemset((void *)matrix_cs, config.matrix_c_size, 0);
-    }
-    else {
-        set_matrix_c(stream, (ElementC*)bias, (const int64_t*)expert_offset_host, (int32_t*)matrix_ds, config.num_experts,
-                               config.M, config.N_d, (ElementC*)matrix_cs);
+    // if (bias == nullptr) {
+        // cudaMemset((void *)matrix_cs, config.matrix_c_size, 0);
+    // }
+    if (bias != nullptr) {
+        set_matrix_c(stream, (ElementC*)bias, (const int64_t*)expert_offset_host,
+                     (int32_t*)matrix_ds, config.num_experts, config.M,
+                     config.N_d, (ElementC*)matrix_cs);
     }
     const ElementA** ptr_As_device = (const ElementA**)((uint8_t*)problem_sizes_device + config.problem_sizes);
     const ElementB** ptr_Bs_device = (const ElementB**)((uint8_t*)ptr_As_device + config.ptr_x_size);
@@ -440,6 +461,7 @@ ppl::common::RetCode moe_column_parallel_grouped_gemm(
 
     // Using the arguments, query for extra workspace required for matrix multiplication computation
     size_t workspace_size = Gemm::get_workspace_size(arguments);
+    std::cout << "workspace size(0): " << workspace_size << std::endl;
     int32_t arguments_workspace_id = enqueue_arguments(arguments);
     config.arguments_workspace_id = arguments_workspace_id;
     config.workspace_size = workspace_size;
@@ -472,8 +494,8 @@ ppl::common::RetCode moe_column_parallel_linear2(
     Gemm gemm;
 
     //std::cout << "before gemm.get_workspace_size" << std::endl;
-    // size_t wp_size = gemm.get_workspace_size(arguments);
-    //std::cout << "workspace size: " << wp_size << std::endl;
+    size_t wp_size = gemm.get_workspace_size(arguments);
+    std::cout << "workspace size(1): " << wp_size << std::endl;
 
     // Check if the problem size is supported or not
     //std::cout << "before gemm.can_implement" << std::endl;
